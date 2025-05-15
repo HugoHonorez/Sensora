@@ -13,12 +13,16 @@
 
 //Définition des broches de l'ESP32
 #define DHTPIN 15           //DHT22
-#define LEDPIN 13           //LED
 #define LDRPIN 34           //LDR (Light Dependent Resistor)
 #define MQ135PIN 32        //MQ-135 (Capteur de qualité de l'air)
+#define LEDPIN 2          //LED pour la qualité de l'air
 
-//Définition des broches d'allumage
-#define MQ135_POWER_PIN 16    // Broche connectée à la Gate du MOSFET
+//Définition de l'activation des capteurs
+bool dhtEnabled = true;
+bool bmpEnabled = true;
+bool ldrEnabled = true;
+bool mq135Enabled = true;
+
 
 // Liste des réseaux connus & adresse ip du serveur associée
 struct WifiCredential {
@@ -28,7 +32,7 @@ struct WifiCredential {
 };
 
 WifiCredential knownNetworks[] = {
-  {"GalaxyA7164D1", "saaw6584", "192.168.111.32"},
+  {"GalaxyA7164D1", "saaw6584", "192.168.215.32"},
   {"Proximus-Home-5088", "wjpc9nam4239x", "192.168.1.30"},
   {"VOO-HJ47MA1", "hZZRJt3XxJ7qKfxNXh", "192.168.0.186"}
 };
@@ -49,9 +53,6 @@ void setup() {
   Wire.begin();
   Serial.println("Starting...");
 
-  //Initialisation des LED
-  pinMode(LEDPIN, OUTPUT);
-
   //Initialisation de l'écran LCD
   lcd.init();
   lcd.backlight();
@@ -64,21 +65,19 @@ void setup() {
     Serial.println("Error: BMP280 not detected.");
     while(1);
   }
-
   pinMode(LDRPIN, INPUT);
   pinMode(MQ135PIN, INPUT);
+
+  //Initialisation des LEDs
+  pinMode(LEDPIN, OUTPUT);
 
   //Initialisation du WiFi
   connectWiFi();
 
   //Initialisation du broker MQTT
   client.setServer(ip, 1883);
-  connectMQTT();
-
   client.setCallback(mqttCallback);
-  pinMode(MQ135_POWER_PIN, OUTPUT);
-  digitalWrite(MQ135_POWER_PIN, HIGH); // Capteur allumé par défaut
-  client.subscribe("sensors/power/mq135");
+  connectMQTT();
 
   //Initialisation du serveur NTP (pour avoir l'heure)
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -93,6 +92,7 @@ void setup() {
   //Message d'initialisation complète
   lcd.clear();
   lcd.print("Ready!");
+
 }
 
 //Boucle de connexion au WiFi
@@ -137,6 +137,10 @@ void connectMQTT() {
     Serial.println("Attempting MQTT broker connection...");
     if (client.connect("ESP32Client")) {
       Serial.println("MQTT broker connected!");
+      client.subscribe("sensors/power/dht22");
+      client.subscribe("sensors/power/bmp280");
+      client.subscribe("sensors/power/ldr");
+      client.subscribe("sensors/power/mq135");
     } else {
       Serial.println("Error: MQTT broker connection failed.");
       delay(2000);
@@ -144,23 +148,27 @@ void connectMQTT() {
   }
 }
 
+//Réceptionne les messages publiés sur les topics sensor/power/
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String msg;
-  for (int i = 0; i < length; i++) {
-    msg += (char)payload[i];
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
   }
+  message.trim();
 
-  msg.trim();
+  Serial.print("Message reçu sur ");
+  Serial.print(topic);
+  Serial.print(" : ");
+  Serial.println(message);
 
-  // Contrôle du capteur MQ-135
-  if (String(topic) == "sensors/power/mq135") {
-    if (msg == "ON") {
-      digitalWrite(MQ135_POWER_PIN, HIGH);
-      Serial.println("MQ135 activé");
-    } else if (msg == "OFF") {
-      digitalWrite(MQ135_POWER_PIN, LOW);
-      Serial.println("MQ135 désactivé");
-    }
+  if (String(topic) == "sensors/power/dht22") {
+    dhtEnabled = (message == "ON");
+  } else if (String(topic) == "sensors/power/bmp280") {
+    bmpEnabled = (message == "ON");
+  } else if (String(topic) == "sensors/power/ldr") {
+    ldrEnabled = (message == "ON");
+  } else if (String(topic) == "sensors/power/mq135") {
+    mq135Enabled = (message == "ON");
   }
 }
 
@@ -212,21 +220,23 @@ void loop() {
   client.loop();
 
   //Lecture des mesures
-  float temperature = dht.readTemperature();                 //Température du DHT22
-  float humidity = dht.readHumidity();                       //Humidité du DHT22
-  float heatIndex = dht.computeHeatIndex(temperature, humidity, false);               //Indice de chaleur du DHT22
+  float temperature = dhtEnabled ? dht.readTemperature() : -1;                 //Température du DHT22
+  float humidity = dhtEnabled ? dht.readHumidity() : -1;                       //Humidité du DHT22
+  float heatIndex = (dhtEnabled && !isnan(temperature) && !isnan(humidity)) ? dht.computeHeatIndex(temperature, humidity, false) : -1;               //Indice de chaleur du DHT22
 
   //float temperature = bmp.readTemperature();                //Température du BMP280 (non-utilisée ici)
-  float pressure = bmp.readPressure() / 100.0F;  //Pression du BMP280 (en hPa)
+  float pressure = bmpEnabled ? bmp.readPressure() / 100.0F : -1;  //Pression du BMP280 (en hPa)
   //float altitude = bmp.readAltitude(1013.25);    //Altitude du BMP280 (non-utilisée ici)
 
-  int light = analogRead(LDRPIN);             //LDR (valeur entre 0 et 4095)
+  int light = ldrEnabled ? analogRead(LDRPIN) : -1;             //LDR (valeur entre 0 et 4095)
 
-  int airQuality;
-  if (digitalRead(MQ135_POWER_PIN) == HIGH) {
-    airQuality = analogRead(MQ135PIN);                 // Valeur brute du capteur MQ-135
+  int airQuality = mq135Enabled ? analogRead(MQ135PIN) : -1;             // Valeur brute du capteur MQ-135
+
+  //Allumer la LED si la qualité de l'air est > 10
+  if (mq135Enabled && airQuality > 10) {
+    digitalWrite(LEDPIN, HIGH);
   } else {
-    airQuality = -1; // Capteur désactivé
+    digitalWrite(LEDPIN, LOW);
   }
 
   //Récupération du timestamp (en secondes)
